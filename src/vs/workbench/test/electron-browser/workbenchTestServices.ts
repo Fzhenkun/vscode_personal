@@ -182,6 +182,7 @@ export class TestNativeHostService implements INativeHostService {
 	async stopTracing(): Promise<void> { }
 	async openDevToolsWindow(url: string): Promise<void> { }
 	async openGPUInfoWindow(): Promise<void> { }
+	async crashRenderer(): Promise<void> { }
 	async openContentTracingWindow(): Promise<void> { }
 	async resolveProxy(url: string): Promise<string | undefined> { return undefined; }
 	async resolveProxyWithPackage() { return []; }

@@ -438,6 +438,8 @@ export interface ICommonNativeHostService {
 	openDevTools(options?: Partial<OpenDevToolsOptions> & INativeHostOptions): Promise<void>;
 	toggleDevTools(options?: INativeHostOptions): Promise<void>;
 	openGPUInfoWindow(): Promise<void>;
+	/** Triggers a native crash in the active renderer for Crashpad development testing. */
+	crashRenderer(): Promise<void>;
 	openDevToolsWindow(url: string): Promise<void>;
 	openContentTracingWindow(): Promise<void>;
 	stopTracing(): Promise<void>;

@@ -54,6 +54,7 @@ import { CancellationToken, CancellationTokenSource } from '../../../base/common
 import { GPUCompositingState } from './gpuCompositingState.js';
 import { AgentHostEditorUpdate, AgentsWindowInvitationState, IAgentHostEditorState, IAgentsWindowInvitation } from '../../chat/common/agentsWindowInvitation.js';
 import { IApplicationStorageMainService } from '../../storage/electron-main/storageMainService.js';
+import { waitForCrashDump } from './crashReporter.js';
 
 export interface INativeHostMainService extends AddFirstParameterToFunctions<ICommonNativeHostService, Promise<unknown> /* only methods, not events */, number | undefined /* window ID */> { }
 
@@ -1374,6 +1375,49 @@ export class NativeHostMainService extends Disposable implements INativeHostMain
 			}
 			window?.focus();
 		}
+	}
+
+	async crashRenderer(windowId: number | undefined): Promise<void> {
+		if (!process.env['VSCODE_DEV']) {
+			throw new Error('Renderer crash testing is only available in development builds.');
+		}
+
+		const window = this.windowById(windowId);
+		if (!window?.win) {
+			throw new Error('Unable to find a window to crash.');
+		}
+
+		const crashDumpsDirectory = app.getPath('crashDumps');
+		const startedAt = Date.now();
+		const browserWindow = window.win;
+		const webContents = browserWindow.webContents;
+
+		this.logService.warn(`[CrashTest] Requesting native renderer crash for window ${window.id}; crashDumps=${crashDumpsDirectory}`);
+		webContents.once('render-process-gone', (_event, details) => {
+			void this.reportRendererCrash(browserWindow, crashDumpsDirectory, startedAt, details.reason, details.exitCode);
+		});
+
+		// Electron implements this operation in the renderer process' native layer.
+		(webContents as typeof webContents & { forcefullyCrashRenderer(): void }).forcefullyCrashRenderer();
+	}
+
+	private async reportRendererCrash(window: BrowserWindow, crashDumpsDirectory: string, startedAt: number, reason: string, exitCode: number): Promise<void> {
+		const dumpPath = await waitForCrashDump(crashDumpsDirectory, startedAt);
+		if (dumpPath) {
+			this.logService.info(`[CrashTest] Renderer exited (reason=${reason}, exitCode=${exitCode}); dump=${dumpPath}`);
+		} else {
+			this.logService.error(`[CrashTest] Renderer exited (reason=${reason}, exitCode=${exitCode}) but no dump was found in ${crashDumpsDirectory}`);
+		}
+
+		await this.dialogMainService.showMessageBox({
+			type: dumpPath ? 'info' : 'error',
+			title: localize('crashRenderer.title', 'Renderer Crash Test'),
+			message: dumpPath ? localize('crashRenderer.dumpCreated', 'Renderer crashed and a dump was created.') : localize('crashRenderer.dumpMissing', 'Renderer crashed, but no dump was found.'),
+			detail: dumpPath
+				? localize('crashRenderer.dumpPath', 'Dump path: {0}\nReason: {1}\nExit code: {2}', dumpPath, reason, exitCode)
+				: localize('crashRenderer.dumpDirectory', 'Crash dump directory: {0}\nReason: {1}\nExit code: {2}', crashDumpsDirectory, reason, exitCode),
+			buttons: [localize('crashRenderer.ok', 'OK')]
+		}, window);
 	}
 
 	private _isTracing = false;

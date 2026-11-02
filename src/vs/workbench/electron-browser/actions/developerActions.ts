@@ -123,6 +123,23 @@ export class ShowGPUInfoAction extends Action2 {
 	}
 }
 
+export class CrashRendererAction extends Action2 {
+
+	constructor() {
+		super({
+			id: 'workbench.action.crashRenderer',
+			title: localize2('crashRenderer', 'Crash Renderer'),
+			category: Categories.Developer,
+			f1: true,
+			precondition: IsDevelopmentContext
+		});
+	}
+
+	override run(accessor: ServicesAccessor): Promise<void> {
+		return accessor.get(INativeHostService).crashRenderer();
+	}
+}
+
 export class ShowContentTracingAction extends Action2 {
 
 	constructor() {

@@ -1,0 +1,162 @@
+{
+  "title": "3.3 Electron 窗口无响应：从检测到恢复操作",
+  "subtitle": "VS Code desktop 主窗口 renderer 卡顿、进程消失与恢复链路研究稿",
+  "language": "zh",
+  "complexity": "complex",
+  "scope": "对象是 VS Code Electron 桌面窗口从 BrowserWindow/WebContents 事件检测异常，到采样、用户决策、窗口销毁和重建的完整链路；证据边界是当前工作区源码与构建产物中的 Electron v43.8.3 线索，不推断 Electron 内部未在本仓库提供的阈值实现。",
+  "essence": "VS Code 把 Electron 的窗口级 unresponsive/responsive 和 renderer 终止/加载失败事件统一收敛到 CodeWindow.onWindowError：卡顿先采样并让用户选择等待、关闭或重开，进程终止则直接进入恢复对话框；重开本质是新建窗口并复用工作区配置，原窗口最后才 destroy。",
+  "context_map": {
+    "scope": "包含主窗口 CodeWindow、WindowsMainService、LifecycleMainService、DialogMainService、Telemetry 和窗口状态/备份服务；不包含扩展宿主自身的 RPC unresponsive 机制、pty host 心跳和 webview 子内容的独立故障处理。",
+    "components": [
+      "Electron BrowserWindow：产生 unresponsive/responsive 事件。",
+      "Electron WebContents：产生 render-process-gone、did-fail-load；提供 mainFrame.collectJavaScriptCallStack()。",
+      "CodeWindow：注册事件、统一分类、采样、对话框和 destroyWindow。",
+      "WindowsMainService：创建新 CodeWindow、装载工作区配置、维护窗口集合。",
+      "LifecycleMainService：正常 unload/reload；kill 时销毁窗口后退出应用。",
+      "Storage/backup/profile services：决定重开后的编辑器恢复、备份和用户配置。"
+    ],
+    "actors": [
+      "Electron 主进程：接收窗口事件并拥有销毁/创建窗口的权限。",
+      "renderer 进程：承载 workbench；JavaScript 主线程卡住时可能触发无响应。",
+      "用户：在警告框中选择 Reopen、Close 或 Keep Waiting。",
+      "CLI 扩展测试/Smoke Test：采用自动化失败或有序退出策略。"
+    ],
+    "flows": [
+      "BrowserWindow 'unresponsive' -> CodeWindow.onWindowError(UNRESPONSIVE) -> 采样 + 警告框 -> destroyWindow(reopen, skipRestoreEditors)。",
+      "BrowserWindow 'responsive' -> onWindowError(RESPONSIVE) -> 取消测试失败计时器、停止采样、清空样本。",
+      "WebContents 'render-process-gone' -> PROCESS_GONE -> 记录 reason/code + 恢复对话框 -> 可重开或关闭。",
+      "WebContents 'did-fail-load' -> LOAD -> 记录 reason/code + 进入 windowerror telemetry；当前处理分支没有像 PROCESS_GONE 一样的用户恢复对话框。",
+      "destroyWindow(reopen=true) -> 根据当前 workspace 构造 openable -> WindowsMainService.open(forceNewWindow=true) -> 新窗口 load -> 旧窗口 destroy。"
+    ],
+    "dependencies": [
+      "Electron BrowserWindow/WebContents 事件语义。",
+      "RunOnceScheduler、Delayer、errorHandler 和 telemetry。",
+      "DialogMainService 的原生 message box。",
+      "Workspace storage memento 与 backup service。"
+    ],
+    "lifecycle": [
+      "构造 CodeWindow：创建 BrowserWindow，初始化采样器和 60 秒扩展测试宽限计时器，注册事件。",
+      "运行：正常事件不影响窗口；异常事件异步进入 onWindowError。",
+      "恢复：responsive 取消诊断；用户选择重开时先创建新窗口再销毁旧窗口。",
+      "终止：destroy 触发 onDidDestroy，WindowsMainService 从窗口集合移除。"
+    ],
+    "failure_surface": [
+      "Electron 判断 renderer 无响应的阈值和平台差异不在 VS Code 源码内。",
+      "卡顿期间 renderer 可能无法响应 IPC，但主进程仍可弹框和销毁 BrowserWindow。",
+      "Keep Waiting 不会暂停检测或自动重试，只会保留窗口和采样，直到 responsive 或用户再次介入。",
+      "重复/竞态事件可能同时触发多个异步 onWindowError；源码没有显式的 per-window error state mutex。"
+    ]
+  },
+  "key_mechanisms": [
+    {
+      "name": "1. 事件接入与错误归一化",
+      "chain": "Electron BrowserWindow/WebContents 事件 -> Event.fromNodeEventEmitter -> WindowError 枚举 -> onWindowError",
+      "importance": "这是检测链路的唯一收口，决定后续是诊断、对话框、退出还是重开。",
+      "points": [
+        {"text": "CodeWindow 在 registerListeners 中监听 BrowserWindow 的 unresponsive/responsive，以及 WebContents 的 render-process-gone/did-fail-load。", "type": "fact", "confidence": "high"},
+        {"text": "WindowError.UNRESPONSIVE=1、PROCESS_GONE=2、LOAD=3、RESPONSIVE=4，窗口错误 telemetry 使用统一事件名 windowerror。", "type": "fact", "confidence": "high"},
+        {"text": "源码只负责消费 Electron 的无响应信号，不在这里计算 renderer 是否卡住；因此“检测阈值”属于 Electron/Chromium 运行时边界。", "type": "inference", "confidence": "high"}
+      ]
+    },
+    {
+      "name": "2. 无响应期间的 JavaScript 栈采样",
+      "chain": "UNRESPONSIVE -> Delayer(sampleInterval) -> mainFrame.collectJavaScriptCallStack -> stack 计数 -> 最长 samplePeriod 停止并上报高频样本",
+      "importance": "它把一次用户可见卡顿转化为可归因的 renderer JavaScript 诊断证据。",
+      "points": [
+        {"text": "默认 sampleInterval=1000ms、samplePeriod=15000ms；非法参数会回退到这两个默认值。参数来自 --unresponsive-sample-interval 和 --unresponsive-sample-period。", "type": "fact", "confidence": "high"},
+        {"text": "每个 stack trace 在 jsCallStackMap 中累计出现次数；相同栈占有效样本数超过 20% 时构造 UnresponsiveSampleError，通过 errorHandler.onUnexpectedError 上报。", "type": "fact", "confidence": "high"},
+        {"text": "采样不是 CPU profile：它是周期性打断 V8 并收集调用栈，能提示热点栈但不能直接证明 wall-clock CPU 占用。", "type": "inference", "confidence": "high"},
+        {"text": "responsive、窗口销毁或 15 秒到期都会停止采样并清空 map；日志还提示用 tracing CPU profile 获取完整视图。", "type": "fact", "confidence": "high"}
+      ]
+    },
+    {
+      "name": "3. 普通窗口的用户恢复决策",
+      "chain": "UNRESPONSIVE -> 主进程 warning message box -> Reopen/Close/Keep Waiting -> destroyWindow 或继续等待",
+      "importance": "这是用户体验和数据恢复的核心策略。",
+      "points": [
+        {"text": "普通卡顿对话框文本为“The window is not responding”，按钮顺序是 Reopen、Close、Keep Waiting；有 workspace 时提供 Don't restore editors 复选框。", "type": "fact", "confidence": "high"},
+        {"text": "Keep Waiting（response=2）不销毁窗口，也不停止采样；responsive 事件到达后才自动清理采样。", "type": "fact", "confidence": "high"},
+        {"text": "Reopen 和 Close 都先停止采样；Reopen 传 reopen=true，Close 传 false。复选框只影响工作区 editor memento，不影响 workspace 本身。", "type": "fact", "confidence": "high"}
+      ]
+    },
+    {
+      "name": "4. renderer 进程终止与加载失败",
+      "chain": "render-process-gone/did-fail-load -> PROCESS_GONE/LOAD -> reason/code telemetry -> PROCESS_GONE 恢复对话框或 LOAD 记录",
+      "importance": "进程死亡与短暂卡顿的可恢复性不同，必须分开研究。",
+      "points": [
+        {"text": "render-process-gone 携带 reason 和 exitCode，日志格式为 renderer process gone；随后给用户 Reopen/New Window 或 Close。", "type": "fact", "confidence": "high"},
+        {"text": "有 workspace 时按钮标签为 Reopen；空窗口时为 New Window。重开失败或用户选择 Close 都会走 destroyWindow。", "type": "fact", "confidence": "high"},
+        {"text": "did-fail-load 也映射到 WindowError.LOAD 并进入 windowerror telemetry，但当前 onWindowError 的非可恢复分支只显式处理 UNRESPONSIVE 和 PROCESS_GONE；LOAD 没有同级对话框。", "type": "fact", "confidence": "high"}
+      ]
+    },
+    {
+      "name": "5. destroyWindow 的重开与数据保护顺序",
+      "chain": "用户选择 -> 可选删除 workspace editor memento -> onDidDestroy 显式广播 -> open(forceNewWindow=true) -> 新窗口 focus -> 旧 BrowserWindow.destroy",
+      "importance": "顺序决定应用是否退出、旧窗口是否还能提供状态，以及编辑器恢复是否发生。",
+      "points": [
+        {"text": "skipRestoreEditors=true 且存在 workspace 时，删除 workspace storage 中的 memento/workbench.parts.editor；失败只记录日志，不阻断后续销毁。", "type": "fact", "confidence": "high"},
+        {"text": "destroy() 不会触发 close 事件，因此代码显式 fire _onDidDestroy；WindowsMainService 收到后从 windows Map 移除。", "type": "fact", "confidence": "high"},
+        {"text": "重开先调用 WindowsMainService.open，传 forceNewWindow=true、当前 workspace/folder 或 forceEmpty=true，然后 focus 新窗口，最后 destroy 旧窗口，以避免最后一个窗口先关闭导致应用退出。", "type": "fact", "confidence": "high"},
+        {"text": "重开会复用当前 userEnv 和 remoteAuthority，并让新窗口重新注册 backup/profile；它不是原 renderer 的原地 reset。", "type": "inference", "confidence": "high"}
+      ]
+    },
+    {
+      "name": "6. 特殊运行模式策略",
+      "chain": "模式识别 -> 调整错误处理 -> 自动退出或忽略误报",
+      "importance": "同一 Electron 信号在开发调试、测试和生产运行中的恢复目标不同。",
+      "points": [
+        {"text": "CLI 扩展测试由 isExtensionDevelopmentTestFromCli 识别：UNRESPONSIVE 启动 60 秒宽限计时器，期间恢复则取消；仍未恢复则 lifecycleMainService.kill(1)。PROCESS_GONE 直接 kill(1)。", "type": "fact", "confidence": "high"},
+        {"text": "Smoke test driver 下，UNRESPONSIVE/PROCESS_GONE 会 destroyWindow(false,false) 后调用 lifecycleMainService.quit()，保证有序退出。", "type": "fact", "confidence": "high"},
+        {"text": "扩展开发主机、扩展测试主机或 DevTools 打开时，UNRESPONSIVE 被视为可能由断点暂停造成，直接返回，不弹生产恢复框。", "type": "fact", "confidence": "high"},
+        {"text": "该断点豁免解决误报，但也意味着调试场景不会获得窗口级卡顿采样和恢复提示。", "type": "inference", "confidence": "high"}
+      ]
+    }
+  ],
+  "anomalies": [
+    {
+      "observation": "LOAD 被统一分类并打 telemetry，但没有看到与 PROCESS_GONE 对等的用户恢复对话框。",
+      "evidence": ["windowImpl.ts:985-1125 的 onWindowError 分支；WindowError.LOAD 定义在 window.ts:203-206"],
+      "historical_explanation": "当前源码未提供历史原因，不能确认这是有意的加载语义差异还是未完成的恢复策略。",
+      "hypotheses": ["did-fail-load 可能包含可忽略的导航失败，因此只记录；真正 renderer 死亡才进入恢复对话框。"],
+      "current_constraint": "仍存在；需要结合 Electron did-fail-load 的 isMainFrame、errorCode 和实际调用场景进一步验证。"
+    },
+    {
+      "observation": "onWindowError 是 async，事件监听没有显式串行化；连续 unresponsive 或 process-gone 可能同时创建对话框。",
+      "evidence": ["registerListeners 直接调用 this.onWindowError(...)；没有 pending promise/state guard"],
+      "historical_explanation": "源码和当前检索范围没有给出历史约束。",
+      "hypotheses": ["Electron 通常只发一次 unresponsive，且 process-gone 后窗口生命周期很短，因此竞态概率被运行时行为压低。"],
+      "current_constraint": "代码层面仍未显式保证幂等；应通过事件序列测试确认。"
+    }
+  ],
+  "boundaries": [
+    {"text": "事实/高：此链路检测的是 BrowserWindow 对应 renderer 的窗口级无响应，不等于扩展宿主、pty host、远程 agent 或 webview 的无响应。", "type": "fact", "confidence": "high"},
+    {"text": "事实/高：responsive 到来前 Keep Waiting 会保持旧窗口；如果 renderer 永远不恢复，生产路径依赖用户选择或外部关闭。", "type": "fact", "confidence": "high"},
+    {"text": "事实/高：重开可以恢复主窗口，但不能修复共享状态、GPU、操作系统资源或同一扩展再次触发的根因；新窗口仍可能复现卡顿。", "type": "inference", "confidence": "high"},
+    {"text": "事实/高：删除 editor memento 会降低启动后恢复旧编辑器的风险/负担，但会牺牲未恢复的编辑器布局状态；源码只在用户勾选时执行。", "type": "inference", "confidence": "high"},
+    {"text": "事实/中：15 秒采样窗口和 20% 高频阈值适合诊断持续性 JavaScript 卡顿，对短于采样周期的瞬时卡顿覆盖有限。", "type": "inference", "confidence": "medium"}
+  ],
+  "verification": [
+    {"check": "代码检查：打开 windowImpl.ts:898-1125，确认四类 Electron 事件、telemetry、特殊模式和对话框分支。", "expected": "事件映射与分支和本文一致。", "result": "已确认。", "limits": "不能证明 Electron 内部何时发出 unresponsive。"},
+    {"check": "参数实验：以 --unresponsive-sample-interval=200 --unresponsive-sample-period=2000 启动，并制造 renderer 主线程长任务。", "expected": "日志出现 CodeWindow unresponsive samples；样本按 stack 计数，约 2 秒后停止。", "result": "待在可控开发构建中执行。", "limits": "需要真实 Electron 桌面运行环境，静态源码检查无法代替。"},
+    {"check": "场景走查：普通 workspace 卡顿后依次选择 Keep Waiting、Reopen、Close，并勾选/不勾选 Don't restore editors。", "expected": "Keep Waiting 保留窗口；Reopen 新窗口先出现再销毁旧窗口；勾选项删除 memento。", "result": "由源码顺序确认，端到端 UI 尚未执行。", "limits": "不能覆盖操作系统级窗口管理器行为。"},
+    {"check": "测试模式走查：启动 CLI extension test，触发 unresponsive 后在 60 秒内恢复与超过 60 秒不恢复两种情况。", "expected": "前者取消 scheduler，后者 lifecycleMainService.kill(1)；process-gone 立即退出码 1。", "result": "由源码确认，尚未运行测试。", "limits": "需要可注入 Electron 事件或真实故障注入。"},
+    {"check": "竞态验证：连续发出 unresponsive、unresponsive、responsive、process-gone 的事件序列，观察是否出现多个 message box 或销毁后的访问。", "expected": "这是当前主要未验证风险；若出现重复对话框，应增加幂等状态保护。", "result": "待测试。", "limits": "需要 mock BrowserWindow/WebContents 和 DialogMainService。"}
+  ],
+  "lenses": [
+    {"name": "假设", "summary": "主进程保持可运行且能执行 BrowserWindow.destroy；renderer 卡住不应阻塞主进程对话框。", "points": [{"text": "如果主进程也卡住，此链路无法弹框或执行恢复；源码没有跨进程 watchdog。", "type": "inference", "confidence": "high"}]},
+    {"name": "核心矛盾", "summary": "恢复速度与数据/用户状态保留之间存在取舍。", "points": [{"text": "Reopen 通过新窗口快速恢复可用性，同时依赖 backup/memento 保留状态；Don't restore editors 是显式降低恢复复杂度的开关。", "type": "inference", "confidence": "high"}]},
+    {"name": "可观测性", "summary": "windowerror 提供粗粒度类型，UnresponsiveSampleError 提供热点栈，二者需要结合分析。", "points": [{"text": "telemetry 记录 type/reason/code；采样日志包含 window id、renderer pid 和 stack，但没有在源码中看到卡顿总时长字段。", "type": "fact", "confidence": "high"}]}
+  ],
+  "conclusion": {
+    "stance": "研究或改造时应以 CodeWindow.onWindowError 为主入口，先区分 UNRESPONSIVE、PROCESS_GONE 和 LOAD，再分别验证采样、用户恢复和自动化退出；不要把扩展宿主的 RPC unresponsive 当成 Electron 窗口无响应。",
+    "risks": ["Electron 事件阈值和平台差异未由仓库源码控制。", "异步错误处理缺少显式幂等状态，存在重复事件竞态待验证。", "重开只能替换 renderer/window，不能消除共享资源或重复触发根因。", "LOAD 分支的用户恢复行为需要产品和历史 issue 证据确认。"],
+    "open_questions": ["当前 Electron v43 在 Windows/macOS/Linux 上触发 BrowserWindow unresponsive 的实际阈值和恢复条件是什么？", "did-fail-load 在 VS Code 主窗口中哪些 errorCode 会进入该分支，为什么不弹恢复对话框？", "是否已有自动化测试覆盖 onWindowError 的重复事件和对话框竞态？", "窗口重开后 backup/memento 的恢复顺序是否会改变未保存编辑器和扩展状态？"]
+  },
+  "sources": [
+    "src/vs/platform/windows/electron-main/windowImpl.ts:744-840, 898-1125, 1128-1182, 1398-1465, 1761-1828",
+    "src/vs/platform/window/electron-main/window.ts:191-212",
+    "src/vs/platform/windows/electron-main/windowsMainService.ts:1602-1743, 1757-1776",
+    "src/vs/platform/lifecycle/electron-main/lifecycleMainService.ts:508-530, 720-756",
+    "build/checksums/electron.txt: Electron v43.8.3 artifacts"
+  ]
+}
